@@ -1,0 +1,213 @@
+"""
+entrenar_clasificador.py
+Paso 2 del proyecto: clasificador de selección de algoritmo.
+"""
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import (accuracy_score, confusion_matrix,
+                             classification_report, ConfusionMatrixDisplay)
+from sklearn.inspection import permutation_importance
+
+DATA     = Path("hh_tsp_dataset") / "data"
+TRAIN    = DATA / "train_labeled.csv"
+TEST     = DATA / "test_labeled.csv"
+COST_MAP = {"2opt_hill_climbing": "cost_2opt_hill_climbing",
+            "sa_2opt":           "cost_sa_2opt",
+            "mst_2opt":          "cost_mst_2opt"}
+COST_COLS = list(COST_MAP.values())
+NUM_FEAT  = ["n", "mean_pairwise_dist", "std_coords",
+             "mean_centroid_dist", "mean_nn_dist"]
+CAT_FEAT  = ["distribution"]
+
+
+def preprocessor():
+    return ColumnTransformer([
+        ("num", StandardScaler(), NUM_FEAT),
+        ("cat", OneHotEncoder(handle_unknown="ignore"), CAT_FEAT),
+    ])
+
+
+def regret(y_pred, te_df):
+    pred = np.array([te_df.iloc[i][COST_MAP[p]] for i, p in enumerate(y_pred)])
+    best = te_df[COST_COLS].min(axis=1).values
+    return pred - best
+
+
+def plot_balance(tr, te):
+    fig, axs = plt.subplots(1, 2, figsize=(12, 4))
+    for ax, df, t in [(axs[0], tr, "Train"), (axs[1], te, "Test")]:
+        vc = df["best_algorithm"].value_counts()
+        vc.plot(kind="bar", ax=ax, color="#4472c4", edgecolor="k")
+        ax.set_title(f"Balance de clases — {t}  (n={len(df)})")
+        ax.set_ylabel("Instancias"); ax.grid(axis="y", alpha=0.3)
+        for i, v in enumerate(vc.values):
+            ax.text(i, v, f"{v}\n({100*v/len(df):.1f}%)",
+                    ha="center", va="bottom", fontsize=9)
+    plt.tight_layout(); plt.savefig("hh_balance.png", dpi=110); plt.show()
+
+
+def evaluate(name, model, Xtr, ytr, Xte, yte, te_df):
+    model.fit(Xtr, ytr)
+    y_pred = model.predict(Xte)
+    most_common = ytr.value_counts().idxmax()
+    y_base = np.full(len(yte), most_common)
+    base_acc = accuracy_score(yte, y_base)
+    acc = accuracy_score(yte, y_pred)
+
+    reg   = regret(y_pred, te_df)
+    reg_b = regret(y_base, te_df)
+
+    print(f"\n--- {name} ---")
+    print(f"  Accuracy:      {acc:.4f}   baseline (siempre '{most_common}'): {base_acc:.4f}  Δ={100*(acc-base_acc):+.2f}pp")
+    print(f"  Regret medio:  {reg.mean():.6f}   baseline={reg_b.mean():.6f}")
+    print(f"  Regret mediana:{np.median(reg):.6f}")
+    print(f"  % óptimas:     {100*(reg<1e-9).mean():.2f}%   baseline={100*(reg_b<1e-9).mean():.2f}%")
+    print(classification_report(yte, y_pred, digits=3, zero_division=0))
+
+    return dict(name=name, model=model, y_pred=y_pred,
+                acc=acc, base_acc=base_acc, regret=reg,
+                classes=sorted(ytr.unique()))
+
+
+def plot_accuracy(results):
+    names = [r["name"] for r in results] + ["Baseline trivial"]
+    vals  = [r["acc"]    for r in results] + [results[0]["base_acc"]]
+    fig, ax = plt.subplots(figsize=(8, 4))
+    colors = ["#4472c4"] * len(results) + ["#a0a0a0"]
+    b = ax.bar(names, vals, color=colors, edgecolor="k")
+    for bar, v in zip(b, vals):
+        ax.text(bar.get_x() + bar.get_width()/2, v + 0.01,
+                f"{v:.3f}", ha="center", fontsize=10)
+    ax.axhline(results[0]["base_acc"], color="gray", ls="--", lw=1)
+    ax.set_ylim(0, 1.05); ax.set_ylabel("Accuracy en test")
+    ax.set_title("Modelos vs baseline trivial")
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout(); plt.savefig("hh_accuracy.png", dpi=110); plt.show()
+
+
+def plot_confusion(r, yte):
+    cm = confusion_matrix(yte, r["y_pred"], labels=r["classes"])
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ConfusionMatrixDisplay(cm, display_labels=r["classes"]).plot(
+        ax=ax, cmap="Blues", colorbar=False, values_format="d")
+    ax.set_title(f"Matriz de confusión — {r['name']}")
+    plt.xticks(rotation=20); plt.tight_layout()
+    plt.savefig("hh_confusion.png", dpi=110); plt.show()
+
+
+def plot_regret(results, te_df):
+    fig, axs = plt.subplots(1, 2, figsize=(14, 4))
+    for r in results:
+        axs[0].hist(r["regret"], bins=30, alpha=0.55,
+                    label=f"{r['name']}  (μ={r['regret'].mean():.4f})")
+    axs[0].set_xlabel("Regret"); axs[0].set_ylabel("Frecuencia")
+    axs[0].set_title("Distribución de regret"); axs[0].legend(); axs[0].grid(alpha=0.3)
+
+    best = max(results, key=lambda r: r["acc"])
+    df = te_df.copy().reset_index(drop=True)
+    df["pred"]   = best["y_pred"]
+    df["regret"] = best["regret"]
+    df.boxplot(column="regret", by="pred", ax=axs[1])
+    axs[1].set_title(f"Regret por algoritmo predicho ({best['name']})")
+    axs[1].set_ylabel("Regret"); plt.suptitle("")
+    plt.tight_layout(); plt.savefig("hh_regret.png", dpi=110); plt.show()
+
+
+def plot_importance(model, Xte, yte):
+    prep, clf = model.named_steps["prep"], model.named_steps["clf"]
+
+    if hasattr(clf, "feature_importances_"):
+        names = []
+        for _, tr, cols in prep.transformers_:
+            names.extend(tr.get_feature_names_out(cols)
+                         if hasattr(tr, "get_feature_names_out") else cols)
+        imp = pd.Series(clf.feature_importances_, index=names).sort_values()
+        fig, ax = plt.subplots(figsize=(8, 4))
+        imp.plot(kind="barh", ax=ax, color="#70ad47", edgecolor="k")
+        ax.set_title("Importancia de características (árbol)")
+        ax.grid(axis="x", alpha=0.3)
+        plt.tight_layout(); plt.savefig("hh_importance.png", dpi=110); plt.show()
+        print("\nFeature importance (árbol/bosque):")
+        print(imp.sort_values(ascending=False).to_string())
+
+    perm = permutation_importance(model, Xte, yte, n_repeats=10,
+                                  random_state=42, n_jobs=-1)
+    pdf = pd.DataFrame({"feature": NUM_FEAT + CAT_FEAT,
+                        "importancia": perm.importances_mean,
+                        "std":         perm.importances_std}
+                       ).sort_values("importancia", ascending=False)
+    print("\nPermutation importance:")
+    print(pdf.to_string(index=False))
+
+
+def main():
+    print("=" * 60)
+    print("PASO 2 — Hiper-heurística de selección")
+    print("=" * 60)
+
+    if not TRAIN.exists() or not TEST.exists():
+        raise FileNotFoundError("Ejecuta primero generar_etiquetas.py")
+
+    tr, te = pd.read_csv(TRAIN), pd.read_csv(TEST)
+    print(f"Train: {len(tr)} | Test: {len(te)}")
+    plot_balance(tr, te)
+
+    Xtr, ytr = tr[NUM_FEAT + CAT_FEAT], tr["best_algorithm"]
+    Xte, yte = te[NUM_FEAT + CAT_FEAT], te["best_algorithm"]
+
+    models = {
+        "Árbol (depth=6)": Pipeline([
+            ("prep", preprocessor()),
+            ("clf",  DecisionTreeClassifier(max_depth=6, random_state=42,
+                                             class_weight="balanced")),
+        ]),
+        "KNN (k=5)": Pipeline([
+            ("prep", preprocessor()),
+            ("clf",  KNeighborsClassifier(n_neighbors=5)),
+        ]),
+        "RandomForest": Pipeline([
+            ("prep", preprocessor()),
+            ("clf",  RandomForestClassifier(n_estimators=300, random_state=42,
+                                             class_weight="balanced", n_jobs=-1)),
+        ]),
+    }
+
+    results = [evaluate(n, m, Xtr, ytr, Xte, yte, te)
+               for n, m in models.items()]
+
+    plot_accuracy(results)
+    best = max(results, key=lambda r: r["acc"])
+    plot_confusion(best, yte)
+    plot_regret(results, te)
+    plot_importance(best["model"], Xte, yte)
+
+    # ------- Análisis cruzado -------
+    te2 = te.copy().reset_index(drop=True)
+    te2["pred"]    = best["y_pred"]
+    te2["correct"] = te2["pred"] == te2["best_algorithm"]
+    te2["regret"]  = best["regret"]
+
+    print("\n=== Accuracy por distribución ===")
+    print(te2.groupby("distribution")["correct"].agg(["mean", "count"]).to_string())
+    print("\n=== Accuracy por n ===")
+    print(te2.groupby("n")["correct"].agg(["mean", "count"]).to_string())
+    print("\n=== Ganador real por distribución ===")
+    print(te.groupby("distribution")["best_algorithm"]
+            .value_counts().to_string())
+    print("\n=== Ganador real por n ===")
+    print(te.groupby("n")["best_algorithm"].value_counts().to_string())
+    print("\n=== Regret medio por distribución ===")
+    print(te2.groupby("distribution")["regret"].agg(["mean", "median", "max"]).to_string())
+
+
+if __name__ == "__main__":
+    main()

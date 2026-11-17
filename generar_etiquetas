@@ -1,0 +1,166 @@
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import time
+
+SA_T0          = 15.0
+SA_ALPHA       = 0.995
+SA_ITERS_PER_N = 150
+
+
+DATA    = Path("hh_tsp_dataset") / "data"
+INST    = DATA / "instances"
+TRAIN   = DATA / "train.csv"
+TEST    = DATA / "test.csv"
+TRAIN_L = DATA / "train_labeled.csv"
+TEST_L  = DATA / "test_labeled.csv"
+
+
+def load_xy(instance_id):
+    return pd.read_csv(INST / f"{instance_id}.csv")[["x", "y"]].values.astype(float)
+
+def dist_matrix(P):
+    return np.sqrt(((P[:, None, :] - P[None, :, :]) ** 2).sum(-1))
+
+def tour_cost(tour, D):
+    i = np.asarray(tour)
+    return D[i, np.roll(i, -1)].sum()
+
+
+def nn_tour(D):
+    n = D.shape[0]
+    cur, unv = 0, set(range(1, n))
+    tour = [cur]
+    while unv:
+        nxt = min(unv, key=lambda j: D[cur, j])
+        tour.append(nxt); unv.remove(nxt); cur = nxt
+    return np.array(tour)
+
+def two_opt(tour, D):
+    n = len(tour)
+    if n < 4: return np.array(tour)
+    t = np.array(tour, copy=True)
+    improved = True
+    while improved:
+        improved = False
+        for i in range(n - 1):
+            for j in range(i + 2, n):
+                if i == 0 and j == n - 1: continue
+                a, b, c, d = t[i], t[i+1], t[j], t[(j+1) % n]
+                delta = D[a, c] + D[b, d] - D[a, b] - D[c, d]
+                if delta < -1e-12:
+                    t[i+1:j+1] = t[i+1:j+1][::-1]
+                    improved = True
+    return t
+
+def hc_2opt(D):
+    """2-opt hill climbing desde NN."""
+    return two_opt(nn_tour(D), D)
+
+def sa_2opt(D, seed=0):
+    """SA + 2-opt desde NN."""
+    rng = np.random.default_rng(seed)
+    n = D.shape[0]
+    if n < 4: return nn_tour(D)
+    iters = max(500, SA_ITERS_PER_N * n)
+    tour = nn_tour(D).tolist()
+    cur_c = tour_cost(tour, D)
+    best_t, best_c = tour.copy(), cur_c
+    T = SA_T0
+    for _ in range(iters):
+        i = int(rng.integers(0, n - 1))
+        j = int(rng.integers(i + 1, n))
+        if i == 0 and j == n - 1: continue
+        a, b, c, d = tour[i], tour[i+1], tour[j], tour[(j+1) % n]
+        delta = D[a, c] + D[b, d] - D[a, b] - D[c, d]
+        if delta < 0 or rng.random() < np.exp(-delta / max(T, 1e-9)):
+            tour[i+1:j+1] = tour[i+1:j+1][::-1]
+            cur_c += delta
+            if cur_c < best_c - 1e-12:
+                best_t, best_c = tour.copy(), cur_c
+        T *= SA_ALPHA
+    return np.array(best_t)
+
+def mst_tour(D):
+    n = D.shape[0]
+    in_tree = np.zeros(n, dtype=bool)
+    key     = np.full(n, np.inf); key[0] = 0
+    parent  = np.full(n, -1, dtype=int)
+    adj     = [[] for _ in range(n)]
+    for _ in range(n):
+        u = int(np.argmin(np.where(in_tree, np.inf, key)))
+        in_tree[u] = True
+        if parent[u] != -1:
+            adj[u].append(parent[u]); adj[parent[u]].append(u)
+        for v in range(n):
+            if not in_tree[v] and D[u, v] < key[v]:
+                key[v] = D[u, v]; parent[v] = u
+    tour, seen = [], np.zeros(n, dtype=bool)
+    def dfs(u):
+        seen[u] = True; tour.append(u)
+        for v in adj[u]:
+            if not seen[v]: dfs(v)
+    dfs(0)
+    return np.array(tour)
+
+def mst_2opt(D):
+    return two_opt(mst_tour(D), D)
+
+
+def process(instance_id):
+    P = load_xy(instance_id)
+    D = dist_matrix(P)
+    seed = int(instance_id.split("_")[1])
+    c1 = tour_cost(hc_2opt(D),   D)
+    c2 = tour_cost(sa_2opt(D, seed), D)
+    c3 = tour_cost(mst_2opt(D),  D)
+    costs = {"2opt_hill_climbing": c1, "sa_2opt": c2, "mst_2opt": c3}
+    return {
+        "instance_id": instance_id,
+        "cost_2opt_hill_climbing": c1,
+        "cost_sa_2opt": c2,
+        "cost_mst_2opt": c3,
+        "best_algorithm": min(costs, key=costs.get),
+    }
+
+
+def label_split(csv_in, csv_out, name):
+    df = pd.read_csv(csv_in)
+    print(f"\n[{name}] {len(df)} instancias...")
+    rows, t0 = [], time.perf_counter()
+    for k, iid in enumerate(df["instance_id"], 1):
+        rows.append(process(iid))
+        if k % 25 == 0 or k == len(df):
+            elapsed = time.perf_counter() - t0
+            eta = elapsed * (len(df) - k) / k
+            print(f"  {k:3d}/{len(df)}  elapsed={elapsed:5.1f}s  ETA={eta:5.1f}s")
+    merged = df.merge(pd.DataFrame(rows), on="instance_id")
+    merged.to_csv(csv_out, index=False)
+    print(f"  → guardado {csv_out}")
+
+
+def main():
+    print("=" * 60)
+    print("PASO 1 — Generar etiquetas con los 3 algoritmos")
+    print("=" * 60)
+    if not INST.exists():
+        raise FileNotFoundError(
+            f"No existe {INST}. Ejecuta primero 'python generate_dataset.py'."
+        )
+    label_split(TRAIN, TRAIN_L, "TRAIN")
+    label_split(TEST,  TEST_L,  "TEST")
+
+    print("\n" + "=" * 60)
+    print("Balance de clases")
+    print("=" * 60)
+    for name in ["train_labeled", "test_labeled"]:
+        df = pd.read_csv(DATA / f"{name}.csv")
+        vc = df["best_algorithm"].value_counts()
+        print(f"\n{name} (n={len(df)}):")
+        for k, v in vc.items():
+            print(f"  {k:22s} {v:4d}  ({100*v/len(df):5.1f}%)")
+
+
+if __name__ == "__main__":
+    main()
